@@ -12,6 +12,8 @@ Commands:
     flat all                 flatten every symbol
     cancel all | cancel PORT | cancel <order_id>
     pos                      positions
+    pnl                      total PnL from the exchange (fills + open positions at mark), per-symbol realized/unrealized
+    trades [N]               your last N fills (default 20)
     orders                   open orders
     book PORT                order book
     fair                     fair values from bot_state.json (written by bot.py every few seconds) + positions
@@ -159,6 +161,21 @@ def main():
                     print(" ->", ex.cancel(what))
             elif cmd in ("pos", "positions"):
                 show_positions(ex)
+            elif cmd == "pnl":
+                raw = ex.positions().get("positions", [])
+                tr = ex._req("GET", "/trades").get("trades", [])
+                cash = sum(t["quantity"] * t["price"] * (1 if t["side"] == "sell" else -1) for t in tr if t.get("kind", "trade") == "trade")
+                mtm = sum(p["quantity"] * p.get("current_price", 0) for p in raw)
+                print(f"  {'sym':6} {'qty':>6} {'avg':>8} {'mark':>8} {'unreal':>8} {'realized':>9}")
+                for p in raw:
+                    print(f"  {p['symbol']:6} {p['quantity']:6d} {p.get('average_price', 0):8.2f} {p.get('current_price', 0):8.2f} {p.get('unrealized_pnl', 0):8.1f} {p.get('realized_pnl', 0):9.1f}")
+                print(f"  TOTAL PnL {cash + mtm:,.0f}   (cash from {sum(1 for t in tr if t.get('kind', 'trade') == 'trade')} fills {cash:,.0f} + open positions at mark {mtm:,.0f})")
+            elif cmd == "trades":
+                n = int(args[1]) if len(args) > 1 else 20
+                tr = ex._req("GET", "/trades").get("trades", [])
+                for t in tr[:n]:
+                    print(f"  {t.get('executed_at', '')[11:19]} {t['symbol']:6} {t['side']:4} {t['quantity']:5d} @ {t['price']:8.2f}  {t.get('kind', '')}")
+                print(f"  ({len(tr)} records total, newest first; 'trades 50' for more)")
             elif cmd == "orders":
                 for o in ex.parse_open_orders(ex.open_orders()):
                     print(f"  {o['id']} {o['symbol']:6} {o['side']:4} {o['quantity']:5d} @ {o['price']}")

@@ -53,14 +53,16 @@ CONFIG = dict(
     MIN_EDGE_FRAC=0.002,        # ... plus 0.2% of the price
     MIN_EDGE_ABS=0.05,          # ... and at least 5 cents
     SIZE_FINAL_R3=1.0,          # fraction of the position limit after the FINAL report in round 3 (settlement known)
-    SIZE_FINAL_R12=0.0,         # after the final report in rounds 1-2 (0 = off: research shows the house already prices
+    SIZE_FINAL_R12=0.3,         # after the final report in rounds 1-2 (0 = off: research shows the house already prices
                                 #   the storm track, and its reaction to a report is only ~25% of ours -> no reliable edge)
     SIZE_PRELIM_R12=0.0,        # after a preliminary report in rounds 1-2 (0 = off, same reason: house moves ~5% of ours)
     SIZE_PRELIM=0.3,            # after the preliminary report in round 3 (settlement nearly known)
     SIZE_PRE_REPORT=0.0,        # while the storm is running and no report is out (0 = no Strategy A trading then)
     FULL_SIZE_AT_EDGE_MULT=2.0,  # full size when |edge| >= this multiple of the required edge; linear below
-    DEPTH_MULT=2.0,             # cap each Strategy A order at this multiple of the size displayed at the quote (0 = off),
-                                #   so resting orders do not eat the position room; the 2-second recheck re-hits
+    DEPTH_MULT=0.0,             # cap each Strategy A order at this multiple of the displayed size (0 = off). Off: live books
+                                #   show ~9 shares at the top level, so orders must sweep deeper, not stop at the quote
+    LEVEL_SWEEP=True,           # round 3: price orders at fair -/+ required edge (sweeps every profitable level and rests there)
+    LEVEL_ORDER_TTL_SECS=45.0,  # round 3: let those orders rest this long (they are the bid/offer we want), then re-price
     RECHECK_SECS=2.0,           # re-run Strategy A against the live quotes this often after a report
     RECHECK_FAST_SECS=0.25,     # ... and this often during RECHECK_FAST_WINDOW seconds after a round-3 report
     RECHECK_FAST_WINDOW=90.0,
@@ -71,8 +73,8 @@ CONFIG = dict(
     BOOK_POLL_SECS=1.0,         # if no quote frames arrive for QUOTE_FALLBACK_AFTER s while running, poll GET /orderbook
     QUOTE_FALLBACK_AFTER=5.0,   #   for every symbol this often instead (12 requests/s, far under the 600/s limit)
     # --- Strategy B: ETF arbitrage
-    ETF_ARB_THRESHOLD=0.60,     # $ per ETF unit after crossing every spread
-    ETF_ARB_UNITS=10,           # ETF units per arb
+    ETF_ARB_THRESHOLD=0.80,     # $ per ETF unit after crossing every spread (live: partial fills + hedge slippage eat ~0.3-0.6)
+    ETF_ARB_UNITS=20,           # ETF units per arb (live cycles fill and hedge cleanly; limits allow 50 ARCH, 100 REBLD)
     ETF_ARB_CROSS_SHARE=0.4,    # the ETF leg's limit crosses the quote by this share of the apparent profit
     ETF_ARB_MAX_PER_MIN=6,
     ETF_ARB_EVERY_SECS=2.0,
@@ -103,6 +105,27 @@ HAVEN_TOP = MODEL["insurers"]["HAVEN"]["attach"] + MODEL["insurers"]["HAVEN"]["l
 OBS_DT = 2.0
 
 log = logging.getLogger("bot")
+
+TRADES_FILE = HERE / "trades_seen.jsonl"
+_trades_seen: dict = {}
+
+
+def merged_trades(live: list) -> list:
+    """Union of every trade record seen so far (persisted) and the live list; newest first."""
+    global _trades_seen
+    if not _trades_seen and TRADES_FILE.exists():
+        for line in TRADES_FILE.read_text().splitlines():
+            try:
+                t = json.loads(line); _trades_seen[t["trade_id"]] = t
+            except Exception:
+                pass
+    new = [t for t in live if t.get("trade_id") and t["trade_id"] not in _trades_seen]
+    if new:
+        with TRADES_FILE.open("a") as f:
+            for t in new:
+                _trades_seen[t["trade_id"]] = t; f.write(json.dumps(t) + "\n")
+    return sorted(_trades_seen.values(), key=lambda t: t.get("executed_at", ""), reverse=True)
+
 
 
 def setup_logging(path: Path, console_level=logging.INFO):
@@ -396,8 +419,10 @@ class Bot:
             log.info("IMPACT: %s", m.get("headline", ""))
         elif t == "damage_report":
             self._on_report(m, from_snapshot=False)
-        elif t in ("announcement", "news"):
+        elif t == "announcement" or (t == "news" and m.get("symbols")):
             self._announce(m)
+        elif t == "news":
+            log.info("NEWS: %s", m.get("headline", ""))
         elif t == "snapshot":
             self._on_snapshot(m)
         elif t == "track":
@@ -533,7 +558,7 @@ class Bot:
         lim = LIMITS[sym]; p = self.pos.get(sym, 0)
         return max(0, lim - p - self.resting(sym, "buy")) if side == "buy" else max(0, lim + p - self.resting(sym, "sell"))
 
-    def send(self, sym: str, side: str, qty: int, price: float, tag: str, reserve: int = 0) -> bool:
+    def send(self, sym: str, side: str, qty: int, price: float, tag: str, reserve: int = 0, ttl: float | None = None) -> bool:
         qty = int(min(qty, self.room(sym, side)))
         if qty <= 0:
             return False
@@ -549,7 +574,8 @@ class Bot:
             stage = self.last_report_stage if self.last_report_round == self.round else "pre"
             tag = f"{tag}|r{self.round}/{stage}|{sym}"
         with self.lock:  # reserve the room immediately so a burst does not overshoot the limit
-            self.orders[oid] = {"symbol": sym, "side": side, "quantity": qty, "price": price, "ts": self.clock(), "tag": tag}
+            self.orders[oid] = {"symbol": sym, "side": side, "quantity": qty, "price": price, "ts": self.clock(), "tag": tag,
+                                "ttl": ttl if ttl is not None else self.cfg["ORDER_TTL_SECS"]}
         log.info("ORDER %-5s %-4s %4d @ %.2f [%s] fair %.2f pos %+d", sym, side, qty, price, tag, self.fair.get(sym, float("nan")), self.pos.get(sym, 0))
         if self.pool:
             self.pool.submit(self._send_now, oid, sym, side, qty, price, tag)
@@ -561,6 +587,8 @@ class Bot:
         try:
             resp = self.ex.place_order(sym, side, qty, price, tag=tag) if self.dry_run else self.ex.place_order(sym, side, qty, price)
             real_id, status, filled = self.ex.parse_order_response(resp)
+            if status == "filled" and not filled:
+                filled = qty  # the live exchange reports status only, no filled_quantity
             with self.lock:
                 o = self.orders.pop(tmp_id, None)
                 if o is None:
@@ -706,7 +734,9 @@ class Bot:
     def expire_orders(self):
         now = self.clock()
         for oid, o in list(self.orders.items()):
-            if now - o["ts"] > self.cfg["ORDER_TTL_SECS"]:
+            if o.get("tag") == "ext":
+                continue  # a manual order placed outside the bot: count it toward the limit, never cancel it
+            if now - o["ts"] > o.get("ttl", self.cfg["ORDER_TTL_SECS"]):
                 self.cancel_order(oid)
 
     # ------------------------------------------------------------------ strategies
@@ -748,8 +778,12 @@ class Bot:
                 + max(c["MIN_EDGE_ABS"], c["MIN_EDGE_FRAC"] * fair)
             if q["ask"] < fair - req:
                 side, edge, px = "buy", fair - q["ask"], q["ask"] * (1 + c["CROSS_FRAC"])
+                if level_mode and c["LEVEL_SWEEP"]:
+                    px = fair - req  # pay up to fair minus the margin: every level swept is still profitable
             elif q["bid"] > fair + req:
                 side, edge, px = "sell", q["bid"] - fair, q["bid"] * (1 - c["CROSS_FRAC"])
+                if level_mode and c["LEVEL_SWEEP"]:
+                    px = fair + req
             else:
                 continue
             conf = min(1.0, edge / (c["FULL_SIZE_AT_EDGE_MULT"] * req))
@@ -763,10 +797,11 @@ class Bot:
             if want <= 0:
                 continue
             plan.append((edge * want, sym, side, want, px, fair, req, edge, q))
+        ttl = c["LEVEL_ORDER_TTL_SECS"] if (level_mode and c["LEVEL_SWEEP"]) else None
         for _, sym, side, want, px, fair, req, edge, q in sorted(plan, key=lambda p: -p[0]):
-            log.info("A/%s %s: %s %.2f sigma %.2f req %.2f quote %.2f/%.2f edge %.2f -> %s %d", trigger, sym,
-                     "fair" if level_mode else "anchor+delta", fair, self.sigma.get(sym, 0), req, q["bid"], q["ask"], edge, side, want)
-            self.send(sym, side, want, px, "A")
+            log.info("A/%s %s: %s %.2f sigma %.2f req %.2f quote %.2f/%.2f edge %.2f -> %s %d @ %.2f", trigger, sym,
+                     "fair" if level_mode else "anchor+delta", fair, self.sigma.get(sym, 0), req, q["bid"], q["ask"], edge, side, want, px)
+            self.send(sym, side, want, px, "A", ttl=ttl)
 
     def strategy_b(self):
         """ETF arbitrage, ETF leg first: buy (sell) the ETF when it is cheap (rich) against the basket of stock
@@ -834,7 +869,7 @@ class Bot:
                     lq = self.live_quote(k)
                     if lq is None:
                         continue
-                    px = lq["ask"] * (1 + 3 * c["CROSS_FRAC"]) if pc["stock_side"] == "buy" else lq["bid"] * (1 - 3 * c["CROSS_FRAC"])
+                    px = lq["ask"] * (1 + 1.5 * c["CROSS_FRAC"]) if pc["stock_side"] == "buy" else lq["bid"] * (1 - 1.5 * c["CROSS_FRAC"])
                     self.send(k, pc["stock_side"], w * n, px, "B", reserve=10)
                 pc["units"] -= n; pc["pos0"] = self.pos[etf]
                 if pc["units"] <= 0:
@@ -897,18 +932,46 @@ class Bot:
         except Exception:
             log.exception("tick failed")
 
+    def refresh_trades(self):
+        """Exact cash from the exchange's own trade history (GET /trades), so the PnL line is not an estimate."""
+        try:
+            r = self.ex._req("GET", "/trades?limit=500")
+        except Exception as exc:
+            log.debug("trades fetch failed: %s", exc)
+            return
+        items = r.get("trades", r) if isinstance(r, dict) else r
+        if not isinstance(items, list):
+            return
+        items = merged_trades(items)
+        cash = 0.0; n = 0
+        for t in items:
+            if t.get("kind", "trade") != "trade":
+                continue  # ETF create/redeem entries are booked value-neutral; the ETF position carries the value
+            try:
+                q = float(t["quantity"]); p = float(t["price"]); side = str(t.get("side", "")).lower()
+            except (KeyError, TypeError, ValueError):
+                continue
+            cash += q * p if side.startswith("s") else -q * p
+            n += 1
+        self.cash_exact, self.n_trades = cash, n
+
     def pnl_estimate(self):
         mtm = 0.0
         for sym, p in self.pos.items():
             m = self.mid(sym)
+            if m is None and self.mid_hist.get(sym):
+                m = self.mid_hist[sym][-1][1]  # market closed / no quote: mark at the last mid seen
             if p and m is not None:
                 mtm += p * m
-        return self.cash_est + mtm
+        cash = self.cash_exact if getattr(self, "cash_exact", None) is not None else self.cash_est
+        return cash + mtm
 
     def report_pnl(self):
+        if not self.dry_run:
+            self.refresh_trades()
         pos = " ".join(f"{k}:{v:+d}" for k, v in self.pos.items() if v)
-        log.info("PNL ~%.0f | round %s %s | storms left %d | open orders %d | actions/min %d | pos %s | msgs %s",
-                 self.pnl_estimate(), self.round, self.phase, self.storms_remaining, len(self.orders), self.rate.used(),
+        log.info("PNL %s%.0f (%d fills) | round %s %s | storms left %d | open orders %d | actions/min %d | pos %s | msgs %s",
+                 "" if getattr(self, "cash_exact", None) is not None else "~", self.pnl_estimate(), getattr(self, "n_trades", 0), self.round, self.phase, self.storms_remaining, len(self.orders), self.rate.used(),
                  pos or "flat", dict(self.counts))
 
     def write_state(self):
