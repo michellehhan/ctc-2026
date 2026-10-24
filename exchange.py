@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -35,12 +36,24 @@ class ExchangeError(Exception):
         self.status, self.body = status, body
 
 
+KEY_FILES = [Path(__file__).resolve().parent / ".ctc_key", Path.home() / ".ctc_key"]
+
+
 def load_key() -> str:
-    """CTC_API_KEY from the environment; exit with a clear message when it is missing."""
+    """The bot key: CTC_API_KEY from the environment, else the first line of ./.ctc_key or ~/.ctc_key."""
     key = os.environ.get("CTC_API_KEY", "").strip()
-    if not key:
-        sys.exit("CTC_API_KEY is not set. Run:  export CTC_API_KEY=your_bot_key   (from the Team page), then start again.")
-    return key
+    if key:
+        return key
+    for p in KEY_FILES:
+        try:
+            if p.exists():
+                key = p.read_text().strip().splitlines()[0].strip()
+                if key:
+                    return key
+        except OSError:
+            pass
+    sys.exit("No bot key found. Either  export CTC_API_KEY=your_bot_key  or put the key on one line in "
+             f"{KEY_FILES[0]}  (from the Team page), then start again.")
 
 
 class Exchange:
@@ -48,6 +61,8 @@ class Exchange:
         self.base = base_url.rstrip("/")
         self.timeout = timeout
         self.s = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=20)  # enough warm connections for a 12-order burst
+        self.s.mount("https://", adapter); self.s.mount("http://", adapter)
         self.s.headers.update({"X-API-Key": key, "User-Agent": USER_AGENT, "Accept": "application/json"})
         self._logged_shapes: set[str] = set()
 

@@ -63,18 +63,21 @@ def _price_arrays(cum: dict, loss: np.ndarray, expo: dict) -> dict:
     return out
 
 
-def _known_state(cum, loss, exposure, prelim, prelim_loss):
-    """Fold the prelim (bias-corrected) into the known damage; estimate exposure when not given."""
+def _known_state(cum, loss, exposure, prelim, prelim_loss, prelim_is_estimate=False):
+    """Fold the prelim (bias-corrected unless it is our own track estimate) into the known damage;
+    estimate exposure when not given."""
     c = {k: float(cum.get(k, 0.0)) for k in ISLAND}
     L = float(loss)
     if prelim:
+        bias = {k: (0.0 if prelim_is_estimate else MODEL["prelim"][k]["bias"]) for k in ISLAND}
+        lbias = 0.0 if prelim_is_estimate else MODEL["prelim"]["loss"]["bias"]
         for k in ISLAND:
-            c[k] += max(0.0, float(prelim.get(k, 0.0)) + MODEL["prelim"][k]["bias"])
+            c[k] += max(0.0, float(prelim.get(k, 0.0)) + bias[k])
         if prelim_loss is not None:
-            L += max(0.0, float(prelim_loss) + MODEL["prelim"]["loss"]["bias"])
+            L += max(0.0, float(prelim_loss) + lbias)
         else:  # derive the loss from the damage (exact linear relation found in research)
             lf = MODEL["loss_from_damage"]
-            L += max(0.0, sum(lf[k] * max(0.0, float(prelim.get(k, 0.0)) + MODEL["prelim"][k]["bias"]) for k in ISLAND))
+            L += max(0.0, sum(lf[k] * max(0.0, float(prelim.get(k, 0.0)) + bias[k]) for k in ISLAND))
     if exposure is None:
         e = {k: MODEL["islands"][k]["mean_expo_per_dmg"] * c[k] for k in ISLAND}
     else:
@@ -100,7 +103,8 @@ def _future(c: dict, L: float, e: dict, r: int):
 
 
 def fair_values(cumulative_damage_pct: dict, season_loss_musd: float, storms_remaining: int = 0,
-                exposure: dict | None = None, prelim: dict | None = None, prelim_loss: float | None = None) -> dict:
+                exposure: dict | None = None, prelim: dict | None = None, prelim_loss: float | None = None,
+                prelim_is_estimate: bool = False) -> dict:
     """Expected settlement per symbol (stocks and ETFs).
 
     cumulative_damage_pct: final damage_pct per island company, summed over storms with a FINAL report.
@@ -109,7 +113,7 @@ def fair_values(cumulative_damage_pct: dict, season_loss_musd: float, storms_rem
     exposure: running total of the outage term per island company (from `storm` observations), or None.
     prelim/prelim_loss: the preliminary report of the storm whose final is still pending, or None.
     """
-    c, L, e = _known_state(cumulative_damage_pct, season_loss_musd, exposure, prelim, prelim_loss)
+    c, L, e = _known_state(cumulative_damage_pct, season_loss_musd, exposure, prelim, prelim_loss, prelim_is_estimate)
     r = int(max(0, min(3, storms_remaining)))
     if r == 0:
         arr = _price_arrays({k: np.array([c[k]]) for k in ISLAND}, np.array([L]), {k: np.array([e[k]]) for k in ISLAND})
@@ -120,11 +124,12 @@ def fair_values(cumulative_damage_pct: dict, season_loss_musd: float, storms_rem
 
 
 def fair_and_sigma(cumulative_damage_pct: dict, season_loss_musd: float, storms_remaining: int = 0,
-                   exposure: dict | None = None, prelim: dict | None = None, prelim_loss: float | None = None):
+                   exposure: dict | None = None, prelim: dict | None = None, prelim_loss: float | None = None,
+                   prelim_is_estimate: bool = False, prelim_sigma: dict | None = None):
     """(fair, sigma, sigma_future) per symbol.
     sigma = uncertainty of our ESTIMATE: prelim-vs-final spread (if a prelim is pending) + model residual.
     sigma_future = spread of the settlement from storms that have not happened yet (0 when all finals are in)."""
-    c, L, e = _known_state(cumulative_damage_pct, season_loss_musd, exposure, prelim, prelim_loss)
+    c, L, e = _known_state(cumulative_damage_pct, season_loss_musd, exposure, prelim, prelim_loss, prelim_is_estimate)
     r = int(max(0, min(3, storms_remaining)))
     if r == 0:
         cum = {k: np.array([c[k]]) for k in ISLAND}; expo = {k: np.array([e[k]]) for k in ISLAND}; loss = np.array([L])
@@ -134,9 +139,10 @@ def fair_and_sigma(cumulative_damage_pct: dict, season_loss_musd: float, storms_
     fair = {k: float(v.mean()) for k, v in arr.items()}
     future_var = {k: float(v.var()) for k, v in arr.items()}  # settlement spread from storms still to come
     var = {k: 0.0 for k in arr}
-    if prelim:  # propagate the prelim-vs-final residual by a symmetric perturbation of every island's damage
-        pert = {k: MODEL["prelim"][k]["diff_std"] for k in ISLAND}
-        lpert = MODEL["prelim"]["loss"]["diff_std"]
+    if prelim:  # propagate the prelim-vs-final residual (or the track estimate's spread) by a symmetric perturbation
+        pert = {k: (prelim_sigma[k] if prelim_sigma else MODEL["prelim"][k]["diff_std"]) for k in ISLAND}
+        lf = MODEL["loss_from_damage"]
+        lpert = (sum(lf[k] * pert[k] for k in ISLAND) / 2.0) if prelim_sigma else MODEL["prelim"]["loss"]["diff_std"]
         up = _price_arrays({k: cum[k] + pert[k] for k in ISLAND}, loss + lpert, expo)
         dn = _price_arrays({k: np.maximum(cum[k] - pert[k], 0) for k in ISLAND}, np.maximum(loss - lpert, 0), expo)
         for k in arr:

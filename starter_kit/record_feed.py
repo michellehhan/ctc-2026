@@ -19,7 +19,15 @@ import contextlib
 import json
 import time
 
+import ssl
+
 import websockets
+
+try:  # macOS python.org builds have no system CA store; use certifi's bundle
+    import certifi
+    SSL_CTX = ssl.create_default_context(cafile=certifi.where())
+except ImportError:
+    SSL_CTX = ssl.create_default_context()
 
 
 async def record(url: str, key: str, out: str, symbols: list[str]) -> None:
@@ -31,7 +39,8 @@ async def record(url: str, key: str, out: str, symbols: list[str]) -> None:
         while True:
             try:
                 async with websockets.connect(f"{url.rstrip('/')}/ws/v1/market-data",
-                                              additional_headers={"X-API-Key": key}) as ws:
+                                              additional_headers={"X-API-Key": key, "User-Agent": "ctc-hurricane-recorder/1.0"},
+                                              ssl=SSL_CTX if url.startswith("wss") else None) as ws:
                     await ws.send(json.dumps(subscribe))
                     print("connected", flush=True)
                     backoff = 1.0

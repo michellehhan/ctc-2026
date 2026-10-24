@@ -1,0 +1,8 @@
+.ctc_key
+bot.log
+dryrun.log
+bot_state.json
+overrides.json
+recording.jsonl
+recorder.out
+__pycache__/

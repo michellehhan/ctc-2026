@@ -69,6 +69,15 @@ create ARCH 2         redeem REBLD 1
 ```
 `fair` shows the bot's fair values, sigma, quotes and positions (from `bot_state.json`, with its age in seconds).
 
+Announcement handling (the bot picks these up within 2 s and logs `OVERRIDES loaded`):
+```
+fair PORT +5       add 5.00 to PORT's fair value (announcement says PORT is worth more)
+fair PORT 60       set PORT's fair value to 60.00
+fair PORT skip     stop the bot trading PORT
+fair PORT clear    remove the override;   fair clear   removes all
+```
+ETF fairs follow the overridden stocks automatically.
+
 ## What to watch
 
 - `PNL ~x | round r phase | storms left n | open orders k | actions/min a | pos ... | msgs {...}` every 10 s.

@@ -15,6 +15,10 @@ Commands:
     orders                   open orders
     book PORT                order book
     fair                     fair values from bot_state.json (written by bot.py every few seconds) + positions
+    fair PORT +5             bot adds 5.00 to PORT's fair value from now on (announcement handling)
+    fair PORT 60             bot uses 60.00 as PORT's fair value
+    fair PORT skip           bot stops trading PORT (Strategy A)
+    fair PORT clear          remove PORT's override;  fair clear  removes all
     create ARCH 2 / redeem REBLD 1
     time                     competition clock
     quit
@@ -31,6 +35,26 @@ from exchange import Exchange, ExchangeError, load_key
 
 HERE = Path(__file__).resolve().parent
 STATE_FILE = HERE / "bot_state.json"
+OVERRIDES_FILE = HERE / "overrides.json"
+
+
+def set_override(args):
+    """fair SYM +5 | SYM 60 | SYM skip | SYM clear | clear"""
+    ov = json.loads(OVERRIDES_FILE.read_text()) if OVERRIDES_FILE.exists() and OVERRIDES_FILE.stat().st_size else {}
+    if args[0].lower() == "clear":
+        ov = {}
+    else:
+        sym = args[0].upper(); what = args[1].lower() if len(args) > 1 else ""
+        if what == "clear":
+            ov.pop(sym, None)
+        elif what == "skip":
+            ov[sym] = {"skip": True}
+        elif what.startswith(("+", "-")):
+            ov[sym] = {"add": float(what)}
+        else:
+            ov[sym] = {"set": float(what)}
+    OVERRIDES_FILE.write_text(json.dumps(ov))
+    print("overrides now:", ov or "none", "(bot picks this up within 2 s; check its log for 'OVERRIDES loaded')")
 CROSS_FRAC = 0.002
 
 
@@ -141,7 +165,10 @@ def main():
             elif cmd == "book":
                 print(json.dumps(ex.orderbook(args[1].upper()), indent=1)[:2000])
             elif cmd == "fair":
-                show_fair(ex)
+                if len(args) > 1:
+                    set_override(args[1:])
+                else:
+                    show_fair(ex)
             elif cmd in ("create", "redeem"):
                 sym = args[1].upper(); qty = int(args[2]) if len(args) > 2 else 1
                 print(" ->", (ex.etf_create if cmd == "create" else ex.etf_redeem)(sym, qty))

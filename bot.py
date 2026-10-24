@@ -59,10 +59,17 @@ CONFIG = dict(
     SIZE_PRELIM=0.3,            # after the preliminary report in round 3 (settlement nearly known)
     SIZE_PRE_REPORT=0.0,        # while the storm is running and no report is out (0 = no Strategy A trading then)
     FULL_SIZE_AT_EDGE_MULT=2.0,  # full size when |edge| >= this multiple of the required edge; linear below
+    DEPTH_MULT=2.0,             # cap each Strategy A order at this multiple of the size displayed at the quote (0 = off),
+                                #   so resting orders do not eat the position room; the 2-second recheck re-hits
     RECHECK_SECS=2.0,           # re-run Strategy A against the live quotes this often after a report
+    RECHECK_FAST_SECS=0.25,     # ... and this often during RECHECK_FAST_WINDOW seconds after a round-3 report
+    RECHECK_FAST_WINDOW=90.0,
+    WARM_EVERY_SECS=20.0,       # keep 12 HTTPS connections warm (cold handshake ~215 ms, warm call ~85 ms measured)
     CROSS_FRAC=0.001,           # limit price crosses the best quote by this fraction
     ORDER_TTL_SECS=8.0,         # cancel our resting orders older than this
     QUOTE_STALE_SECS=15.0,      # ignore quotes older than this (live mode)
+    BOOK_POLL_SECS=1.0,         # if no quote frames arrive for QUOTE_FALLBACK_AFTER s while running, poll GET /orderbook
+    QUOTE_FALLBACK_AFTER=5.0,   #   for every symbol this often instead (12 requests/s, far under the 600/s limit)
     # --- Strategy B: ETF arbitrage
     ETF_ARB_THRESHOLD=0.60,     # $ per ETF unit after crossing every spread
     ETF_ARB_UNITS=10,           # ETF units per arb
@@ -81,6 +88,7 @@ CONFIG = dict(
     TICK=0.01,
     LOG_FILE="bot.log",
     STATE_FILE="bot_state.json",
+    OVERRIDES_FILE="overrides.json",  # written by manual.py: {"PORT": {"add": 5.0}, "HAVEN": {"set": 30.0}, "GEN": {"skip": true}}
     # --- dry run (replay of history/season-NNN)
     DRY_RUN_SPREAD_FRAC=0.003,  # full bid-ask spread of the synthetic house quotes as a fraction of price (unknown on testnet)
     DRY_RUN_LATENCY_SAMPLES=1,  # our order reaches the book this many 2-second samples after we send it
@@ -253,9 +261,11 @@ class Bot:
     def __init__(self, ex, clock, cfg: dict, dry_run: bool, size_scale: float = 1.0):
         self.ex, self.clock, self.cfg, self.dry_run, self.size_scale = ex, clock, cfg, dry_run, size_scale
         self.rate = RateLimiter(cfg["RATE_BUDGET_PER_MIN"], clock)
-        self.pool = None if dry_run else ThreadPoolExecutor(max_workers=8)
+        self.pool = None if dry_run else ThreadPoolExecutor(max_workers=14)
         self.lock = threading.RLock()
         self.counts = collections.Counter()
+        self.overrides: dict = {}
+        self.overrides_mtime = 0.0
         self.reset_season()
         self.quotes: dict[str, dict] = {}
         self.pos: dict[str, int] = {s: 0 for s in SYMBOLS}
@@ -267,6 +277,8 @@ class Bot:
         self.mid_hist: dict[str, collections.deque] = {s: collections.deque() for s in SYMBOLS}
         self.arb_stamps = collections.deque()
         self.connected = False
+        self.last_quote_frame = -1e9
+        self.book_fallback_on = False
 
     # ------------------------------------------------------------------ season state
     def reset_season(self):
@@ -293,6 +305,7 @@ class Bot:
         self.fair_prev: dict = {}
         self.anchor_mid: dict = {}
         self.anchor_ts = -1e9
+        self.last_report_ts = -1e9
         self.compute_fairs()
 
     @property
@@ -313,11 +326,15 @@ class Bot:
             self.connected = False
         else:
             self.counts[f"frame:{t}"] += 1
+            if self.counts[f"frame:{t}"] == 1:
+                log.info("first frame of type %r: %s", t, json.dumps(frame)[:600])
 
     def on_quote(self, q: dict):
         sym = q.get("symbol")
         if sym not in LIMITS:
             return
+        if self.counts["quote"] == 0 or (self.counts["quote"] == 200 and not self.dry_run):
+            log.info("raw quote frame (#%d): %s", self.counts["quote"], json.dumps(q)[:500])
         bid = q.get("bid", q.get("best_bid", q.get("bid_price")))
         ask = q.get("ask", q.get("best_ask", q.get("ask_price")))
         if isinstance(bid, dict):
@@ -325,13 +342,17 @@ class Bot:
         if isinstance(ask, dict):
             ask = ask.get("price")
         now = self.clock()
-        self.quotes[sym] = {"bid": float(bid) if bid is not None else None, "ask": float(ask) if ask is not None else None, "ts": now}
+        bs = q.get("bid_size"); asz = q.get("ask_size")
+        self.quotes[sym] = {"bid": float(bid) if bid is not None else None, "ask": float(ask) if ask is not None else None, "ts": now,
+                            "bid_size": int(bs) if isinstance(bs, (int, float)) else None,
+                            "ask_size": int(asz) if isinstance(asz, (int, float)) else None}
         if bid is not None and ask is not None:
             h = self.mid_hist[sym]
             h.append((now, 0.5 * (float(bid) + float(ask))))
             while h and now - h[0][0] > 60.0:
                 h.popleft()
         self.counts["quote"] += 1
+        self.last_quote_frame = now
 
     def on_news(self, m: dict):
         t = m.get("type")
@@ -426,6 +447,7 @@ class Bot:
         else:
             return
         self.last_report_round, self.last_report_stage = rnd, stage
+        self.last_report_ts = self.clock()
         log.info("REPORT %s round %d%s: loss %.0f (season %.0f) dmg %s | cum %s", stage.upper(), rnd,
                  " (from snapshot)" if from_snapshot else "", loss, self.loss, dmg, {k: round(v, 1) for k, v in self.cum.items()})
         self.compute_fairs()
@@ -457,8 +479,36 @@ class Bot:
             self.fair, self.sigma, self.sigma_future = fair_and_sigma(
                 self.cum, self.loss, storms_remaining=self.storms_remaining, exposure=self.expo,
                 prelim=self.prelim, prelim_loss=self.prelim_loss)
+            self.apply_overrides()
         except Exception:
             log.exception("fair value computation failed")
+
+    def load_overrides(self):
+        """Pick up manual fair-value overrides from overrides.json (manual.py 'fair PORT +5' etc.)."""
+        if self.dry_run:
+            return
+        p = HERE / self.cfg["OVERRIDES_FILE"]
+        try:
+            m = p.stat().st_mtime if p.exists() else 0.0
+            if m != self.overrides_mtime:
+                self.overrides_mtime = m
+                self.overrides = json.loads(p.read_text()) if p.exists() and p.stat().st_size else {}
+                log.warning("OVERRIDES loaded: %s", self.overrides or "none")
+                self.compute_fairs()
+        except Exception as exc:
+            log.warning("overrides file unreadable: %s", exc)
+
+    def apply_overrides(self):
+        for sym, o in self.overrides.items():
+            if sym not in self.fair or not isinstance(o, dict):
+                continue
+            if "set" in o:
+                self.fair[sym] = float(o["set"])
+            if "add" in o:
+                self.fair[sym] += float(o["add"])
+        for etf, basket in ETFS.items():  # keep ETF fairs consistent with overridden stocks
+            if any(k in self.overrides for k in basket) and etf not in self.overrides:
+                self.fair[etf] = sum(w * self.fair[k] for k, w in basket.items())
 
     def mid(self, sym: str):
         q = self.quotes.get(sym)
@@ -599,6 +649,60 @@ class Bot:
             except Exception as exc:
                 log.debug("time poll failed: %s", exc)
 
+    def poll_books(self):
+        """Fallback quote source: GET /orderbook for every symbol (used only when the quote channel is silent)."""
+        if not self.book_fallback_on:
+            self.book_fallback_on = True
+            log.warning("no quote frames for %.0fs while running: polling GET /orderbook every %.0fs instead",
+                        self.cfg["QUOTE_FALLBACK_AFTER"], self.cfg["BOOK_POLL_SECS"])
+
+        def fetch(sym):
+            try:
+                book = self.ex.orderbook(sym)
+            except Exception as exc:
+                log.debug("orderbook %s failed: %s", sym, exc)
+                return
+            if self.counts["book"] == 0:
+                log.info("raw orderbook payload (first time): %s", json.dumps(book)[:600])
+            self.counts["book"] += 1
+            bids = book.get("bids") or book.get("bid") or []
+            asks = book.get("asks") or book.get("ask") or []
+
+            def px(level):
+                if isinstance(level, dict):
+                    return float(level.get("price"))
+                return float(level[0])
+            try:
+                bid = max((px(l) for l in bids), default=None) if isinstance(bids, list) else None
+                ask = min((px(l) for l in asks), default=None) if isinstance(asks, list) else None
+            except (TypeError, ValueError, KeyError):
+                return
+            if bid is None and isinstance(book.get("best_bid"), (int, float)):
+                bid = float(book["best_bid"])
+            if ask is None and isinstance(book.get("best_ask"), (int, float)):
+                ask = float(book["best_ask"])
+            if bid is not None and ask is not None:
+                q = {"symbol": sym, "bid": bid, "ask": ask}
+                with self.lock:
+                    self.on_quote(q)
+                    self.last_quote_frame = -1e9  # keep the fallback active until real frames arrive
+        if self.pool:
+            for s in SYMBOLS:
+                self.pool.submit(fetch, s)
+        else:
+            for s in SYMBOLS:
+                fetch(s)
+
+    def warm_connections(self):
+        """Fire 12 cheap parallel GETs so the connection pool holds warm keep-alive connections for the order burst."""
+        def ping():
+            try:
+                self.ex.time()
+            except Exception:
+                pass
+        for _ in range(12):
+            self.pool.submit(ping)
+
     def expire_orders(self):
         now = self.clock()
         for oid, o in list(self.orders.items()):
@@ -627,7 +731,10 @@ class Bot:
         level_mode = self.round >= 3 and self.last_report_round >= 3  # settlement (nearly) known: trade the level
         if not level_mode and (self.clock() - self.anchor_ts > c["ANCHOR_WINDOW_SECS"] or not self.fair_prev):
             return
+        plan = []
         for sym in SYMBOLS:
+            if (self.overrides.get(sym) or {}).get("skip"):
+                continue
             q = self.live_quote(sym)
             if q is None:
                 continue
@@ -650,8 +757,13 @@ class Bot:
             pos = self.pos.get(sym, 0)
             want = target - pos if side == "buy" else target + pos  # shares to add on this side
             want -= self.resting(sym, side)
+            shown = q.get("ask_size") if side == "buy" else q.get("bid_size")
+            if c["DEPTH_MULT"] and shown:
+                want = min(want, max(1, int(c["DEPTH_MULT"] * shown)))
             if want <= 0:
                 continue
+            plan.append((edge * want, sym, side, want, px, fair, req, edge, q))
+        for _, sym, side, want, px, fair, req, edge, q in sorted(plan, key=lambda p: -p[0]):
             log.info("A/%s %s: %s %.2f sigma %.2f req %.2f quote %.2f/%.2f edge %.2f -> %s %d", trigger, sym,
                      "fair" if level_mode else "anchor+delta", fair, self.sigma.get(sym, 0), req, q["bid"], q["ask"], edge, side, want)
             self.send(sym, side, want, px, "A")
@@ -767,15 +879,21 @@ class Bot:
                 self.last["poll"] = now; self.poll()
             if self.pending_conv:
                 self.process_conversions()
-            if now - self.last["recheck"] >= c["RECHECK_SECS"] and self.fair:
+            if not self.dry_run and self.running and now - self.last_quote_frame > c["QUOTE_FALLBACK_AFTER"] \
+                    and now - self.last["book"] >= c["BOOK_POLL_SECS"]:
+                self.last["book"] = now; self.poll_books()
+            fast = self.last_report_round >= 3 and now - self.last_report_ts < c["RECHECK_FAST_WINDOW"]
+            if now - self.last["recheck"] >= (c["RECHECK_FAST_SECS"] if fast else c["RECHECK_SECS"]) and self.fair:
                 self.last["recheck"] = now
                 self.compute_fairs(); self.strategy_a("recheck")
+            if not self.dry_run and now - self.last["warm"] >= c["WARM_EVERY_SECS"]:
+                self.last["warm"] = now; self.warm_connections()
             if now - self.last["arb"] >= c["ETF_ARB_EVERY_SECS"]:
                 self.last["arb"] = now; self.strategy_b()
             if now - self.last["pnl"] >= c["PNL_EVERY_SECS"]:
                 self.last["pnl"] = now; self.report_pnl()
             if now - self.last["state"] >= 2.0:
-                self.last["state"] = now; self.write_state()
+                self.last["state"] = now; self.write_state(); self.load_overrides()
         except Exception:
             log.exception("tick failed")
 
@@ -812,8 +930,13 @@ class Bot:
 # ======================================================================================================
 def run_live(cfg: dict, size_scale: float):
     key = load_key()
-    import websockets
+    import ssl
     from websockets.sync.client import connect
+    try:  # python.org builds of Python on macOS have no system CA store; use certifi's bundle (ships with requests)
+        import certifi
+        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        ssl_ctx = ssl.create_default_context()
 
     ex = Exchange(key, cfg["BASE_URL"])
     bot = Bot(ex, time.monotonic, cfg, dry_run=False, size_scale=size_scale)
@@ -831,7 +954,7 @@ def run_live(cfg: dict, size_scale: float):
         while True:
             try:
                 with connect(ws_url, additional_headers={"X-API-Key": key, "User-Agent": "ctc-hurricane-bot/1.0"},
-                             open_timeout=10, close_timeout=2) as ws:
+                             open_timeout=10, close_timeout=2, ssl=ssl_ctx if ws_url.startswith("wss") else None) as ws:
                     ws.send(json.dumps(subscribe))
                     frames.put({"type": "_connected"})
                     log.info("websocket connected and subscribed")
@@ -852,7 +975,7 @@ def run_live(cfg: dict, size_scale: float):
     while True:
         try:
             try:
-                frame = frames.get(timeout=0.2)
+                frame = frames.get(timeout=0.05)
                 bot.handle_frame(frame)
                 while True:  # drain what is queued so bursts are handled at once
                     frame = frames.get_nowait()
